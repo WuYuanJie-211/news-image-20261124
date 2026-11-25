@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
-"""Write the verified news front-page PNG to the grader output folder.
+"""Copy this folder's entry.png into the grader's output directory.
 
-The program reads entry.png from its own directory, validates the PNG
-structure, writes those exact bytes to $MAKEFUN_OUTPUT_DIR/entry.png
-and then forces the output file mode to 0644, so a checker running
-under a different identity in the grading sandbox can read it.
+The grader sets MAKEFUN_OUTPUT_DIR and expects exactly one file there:
+entry.png, 1024 by 1024 pixels, no larger than 1 MiB, readable by
+whoever runs the checks.  The file is therefore written straight to
+its final name (never staged through a temporary file, which would
+leave it with restrictive permissions) and then chmodded to 0644.
 
-Only the Python standard library is used. Nothing is written anywhere
-except the single output file, and no network access is made.
+After writing, the output is read back and compared byte for byte
+with the source, so a silent short write cannot slip through.
+
+Standard library only; no network, no extra files.
 """
 
 import hashlib
@@ -17,137 +20,131 @@ import sys
 import zlib
 from pathlib import Path
 
-PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
-MAX_BYTES = 1024 * 1024
-EXPECTED_WIDTH = 1024
-EXPECTED_HEIGHT = 1024
+SIGNATURE = b"\x89PNG\r\n\x1a\n"
+LIMIT = 1024 * 1024
+SIDE = 1024
 
 
-def fail(message):
-    print(f"error: {message}", file=sys.stderr)
-    raise SystemExit(1)
+def die(text):
+    print("error: " + text, file=sys.stderr)
+    sys.exit(1)
 
 
-def read_source():
-    source = Path(__file__).resolve().parent / "entry.png"
+def source_bytes():
+    here = Path(__file__).resolve().parent
+    src = here / "entry.png"
     try:
-        data = source.read_bytes()
-    except OSError as exc:
-        fail(f"cannot read source entry.png next to main.py: {exc}")
-    if not data:
-        fail("source entry.png is empty")
-    if len(data) > MAX_BYTES:
-        fail(f"source entry.png is {len(data)} bytes, over the 1 MiB limit")
-    return source, data
+        blob = src.read_bytes()
+    except OSError as err:
+        die("cannot read entry.png beside main.py: %s" % err)
+    if len(blob) == 0:
+        die("source entry.png is empty")
+    if len(blob) > LIMIT:
+        die("source entry.png is %d bytes, over the 1 MiB limit" % len(blob))
+    return src, blob
 
 
-def check_chunk_crc(chunk_type, chunk_data, stored_crc, where):
-    actual = zlib.crc32(chunk_type + chunk_data) & 0xFFFFFFFF
-    if actual != stored_crc:
-        fail(f"{where}: bad CRC for chunk {chunk_type!r}")
+def crc_ok(kind, payload, stored):
+    return (zlib.crc32(kind + payload) & 0xFFFFFFFF) == stored
 
 
-def validate_png(data):
-    if data[:8] != PNG_SIGNATURE:
-        fail("bad PNG signature")
-    if len(data) < 8 + 25:  # signature + smallest possible IHDR chunk
-        fail("file too short for an IHDR chunk")
-    offset = 8
-    length = struct.unpack(">I", data[offset:offset + 4])[0]
-    chunk_type = data[offset + 4:offset + 8]
-    if chunk_type != b"IHDR":
-        fail("first chunk is not IHDR")
-    if length != 13:
-        fail(f"IHDR length is {length}, expected 13")
-    ihdr = data[offset + 8:offset + 21]
-    stored = struct.unpack(">I", data[offset + 21:offset + 25])[0]
-    check_chunk_crc(chunk_type, ihdr, stored, "IHDR")
-    width, height = struct.unpack(">II", ihdr[0:8])
-    bit_depth = ihdr[8]
-    color_type = ihdr[9]
-    compression = ihdr[10]
-    filter_method = ihdr[11]
-    interlace = ihdr[12]
-    if (width, height) != (EXPECTED_WIDTH, EXPECTED_HEIGHT):
-        fail(f"IHDR size is {width}x{height}, expected 1024x1024")
-    if bit_depth != 8:
-        fail(f"bit depth is {bit_depth}, expected 8")
-    if color_type not in (2, 6):
-        fail(f"color type is {color_type}, expected 2 or 6")
-    if compression != 0:
-        fail(f"compression method is {compression}, expected 0")
-    if filter_method != 0:
-        fail(f"filter method is {filter_method}, expected 0")
-    if interlace not in (0, 1):
-        fail(f"interlace method is {interlace}, expected 0 or 1")
-    offset += 25
-    seen_idat = False
-    seen_iend = False
-    while offset < len(data):
-        if len(data) - offset < 12:
-            fail("truncated chunk header")
-        length = struct.unpack(">I", data[offset:offset + 4])[0]
-        chunk_type = data[offset + 4:offset + 8]
-        end = offset + 12 + length
-        if end > len(data):
-            fail(f"chunk {chunk_type!r} overruns the file")
-        chunk_data = data[offset + 8:offset + 8 + length]
-        stored = struct.unpack(">I", data[offset + 8 + length:end])[0]
-        check_chunk_crc(chunk_type, chunk_data, stored, f"chunk at {offset}")
-        if chunk_type == b"IDAT":
-            seen_idat = True
-        if chunk_type == b"IEND":
-            if length != 0:
-                fail("IEND chunk carries data")
-            if end != len(data):
-                fail("bytes follow the IEND chunk")
-            seen_iend = True
-            offset = end
+def check_png(blob):
+    if blob[:8] != SIGNATURE:
+        die("bad PNG signature")
+    if len(blob) < 33:
+        die("file too short to hold an IHDR chunk")
+    size = struct.unpack(">I", blob[8:12])[0]
+    kind = blob[12:16]
+    if kind != b"IHDR" or size != 13:
+        die("first chunk is not a 13-byte IHDR")
+    ihdr = blob[16:29]
+    if not crc_ok(kind, ihdr, struct.unpack(">I", blob[29:33])[0]):
+        die("IHDR chunk CRC mismatch")
+    width, height = struct.unpack(">II", ihdr[:8])
+    depth, colour, comp, filt, inter = ihdr[8], ihdr[9], ihdr[10], ihdr[11], ihdr[12]
+    if (width, height) != (SIDE, SIDE):
+        die("PNG is %dx%d, expected 1024x1024" % (width, height))
+    if depth != 8:
+        die("bit depth is %d, expected 8" % depth)
+    if colour not in (2, 6):
+        die("colour type is %d, expected 2 or 6" % colour)
+    if comp != 0 or filt != 0:
+        die("unexpected compression or filter method")
+    if inter not in (0, 1):
+        die("unexpected interlace method")
+    pos = 33
+    saw_data = False
+    idat = bytearray()
+    while True:
+        if len(blob) - pos < 12:
+            die("truncated chunk at offset %d" % pos)
+        size = struct.unpack(">I", blob[pos:pos + 4])[0]
+        kind = blob[pos + 4:pos + 8]
+        end = pos + 12 + size
+        if end > len(blob):
+            die("chunk %r overruns the file" % kind)
+        payload = blob[pos + 8:pos + 8 + size]
+        stored = struct.unpack(">I", blob[pos + 8 + size:end])[0]
+        if not crc_ok(kind, payload, stored):
+            die("chunk %r CRC mismatch" % kind)
+        if kind == b"IDAT":
+            saw_data = True
+            idat += payload
+        if kind == b"IEND":
+            if size != 0:
+                die("IEND chunk carries data")
+            if end != len(blob):
+                die("bytes follow the IEND chunk")
             break
-        offset = end
-    if not seen_idat:
-        fail("no IDAT chunk found")
-    if not seen_iend:
-        fail("no IEND chunk found")
-    if offset != len(data):
-        fail("trailing bytes after IEND")
+        pos = end
+    if not saw_data:
+        die("no IDAT chunk found")
+    if inter == 0:
+        # A CRC can pass while the compressed image data itself is broken,
+        # so inflate it and check the scanline layout as well.
+        channels = 3 if colour == 2 else 4
+        want_len = SIDE * (1 + SIDE * channels)
+        try:
+            raw = zlib.decompress(bytes(idat))
+        except zlib.error as err:
+            die("IDAT data does not inflate: %s" % err)
+        if len(raw) != want_len:
+            die("inflated image is %d bytes, expected %d" % (len(raw), want_len))
 
 
-def output_path():
-    out_dir = os.environ.get("MAKEFUN_OUTPUT_DIR")
-    if not out_dir:
-        fail("MAKEFUN_OUTPUT_DIR is not set")
-    out_dir_path = Path(out_dir)
-    if out_dir_path.exists() and not out_dir_path.is_dir():
-        fail(f"MAKEFUN_OUTPUT_DIR {out_dir!r} is not a directory")
-    out_dir_path.mkdir(parents=True, exist_ok=True)
-    return out_dir_path / "entry.png"
+def target_path():
+    raw = os.environ.get("MAKEFUN_OUTPUT_DIR")
+    if not raw:
+        die("MAKEFUN_OUTPUT_DIR is not set")
+    folder = Path(raw)
+    if folder.exists() and not folder.is_dir():
+        die("MAKEFUN_OUTPUT_DIR %r is not a directory" % raw)
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder / "entry.png"
 
 
-def main():
-    source, data = read_source()
-    validate_png(data)
-    digest = hashlib.sha256(data).hexdigest()
-    target = output_path()
-    if target.resolve() == source.resolve():
-        fail("output path is the source file; refusing to overwrite it")
-    # Direct write: no temporary file is staged in the output directory,
-    # so the finished entry.png never inherits tempfile's 0600 mode.
-    with open(target, "wb") as handle:
-        handle.write(data)
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.chmod(target, 0o644)
-    written = target.read_bytes()
-    if hashlib.sha256(written).hexdigest() != digest:
-        fail("output hash does not match the source")
-    if len(written) != len(data):
-        fail("output size does not match the source")
-    mode = os.stat(target).st_mode & 0o777
+def run():
+    src, blob = source_bytes()
+    check_png(blob)
+    want = hashlib.sha256(blob).hexdigest()
+    dest = target_path()
+    if dest.resolve() == src.resolve():
+        die("output path is the source file; refusing to overwrite it")
+    with open(dest, "wb") as out:
+        out.write(blob)
+        out.flush()
+        os.fsync(out.fileno())
+    os.chmod(dest, 0o644)
+    back = dest.read_bytes()
+    if hashlib.sha256(back).hexdigest() != want:
+        die("output hash does not match the source")
+    if len(back) != len(blob):
+        die("output size does not match the source")
+    mode = os.stat(dest).st_mode & 0o777
     if mode != 0o644:
-        fail(f"output mode is {mode:03o}, expected 644")
-    print(f"wrote {target} ({len(data)} bytes, sha256={digest}, mode=0644)")
+        die("output mode is %03o, expected 644" % mode)
+    print("wrote %s (%d bytes, sha256=%s, mode=0644)" % (dest, len(blob), want))
 
 
 if __name__ == "__main__":
-    main()
+    run()
