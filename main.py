@@ -112,6 +112,22 @@ def check_png(blob):
             die("inflated image is %d bytes, expected %d" % (len(raw), want_len))
 
 
+def verify_output(dest, blob, want):
+    """Re-read the written file and prove it is the same valid PNG.
+
+    A hash match alone cannot catch a file that was truncated after
+    the write, so the bytes are run through the full PNG structure
+    check again instead of trusting the hash by itself.
+    """
+    back = dest.read_bytes()
+    check_png(back)
+    if hashlib.sha256(back).hexdigest() != want:
+        die("output hash does not match the source")
+    if len(back) != len(blob):
+        die("output size does not match the source")
+    return back
+
+
 def target_path():
     raw = os.environ.get("MAKEFUN_OUTPUT_DIR")
     if not raw:
@@ -135,15 +151,11 @@ def run():
         out.flush()
         os.fsync(out.fileno())
     os.chmod(dest, 0o644)
-    back = dest.read_bytes()
-    if hashlib.sha256(back).hexdigest() != want:
-        die("output hash does not match the source")
-    if len(back) != len(blob):
-        die("output size does not match the source")
+    back = verify_output(dest, blob, want)
     mode = os.stat(dest).st_mode & 0o777
     if mode != 0o644:
         die("output mode is %03o, expected 644" % mode)
-    print("wrote %s (%d bytes, sha256=%s, mode=0644)" % (dest, len(blob), want))
+    print("wrote %s (%d bytes, sha256=%s, mode=0644, revalidated)" % (dest, len(blob), want))
 
 
 if __name__ == "__main__":
